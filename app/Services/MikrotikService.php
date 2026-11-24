@@ -106,6 +106,37 @@ class MikrotikService
         return $result;
     }
 
+    public function getNeighbors(): array
+    {
+        try {
+            $rawNeighbors = $this->client()->query('/ip/neighbor/print')->read();
+            $neighbors = [];
+
+            foreach ($rawNeighbors as $n) {
+                $identity = $n['identity'] ?? ($n['board'] ?? 'Unknown-Neighbor');
+                $ip       = $n['address'] ?? ($n['address4'] ?? null);
+                $iface    = $n['interface'] ?? 'ether1';
+                $mac      = $n['mac-address'] ?? '';
+                $platform = $n['platform'] ?? ($n['board'] ?? 'MikroTik');
+                $board    = $n['board'] ?? 'RouterOS';
+
+                $neighbors[] = [
+                    'identity'  => $identity,
+                    'ip'        => $ip,
+                    'interface' => $iface,
+                    'mac'       => $mac,
+                    'platform'  => $platform,
+                    'board'     => $board,
+                    'version'   => $n['version'] ?? '-',
+                ];
+            }
+
+            return $neighbors;
+        } catch (Throwable) {
+            return [];
+        }
+    }
+
     private function getRouterOwnIps(): array
     {
         return Cache::remember('mt_router_own_ips', 30, function () {
@@ -496,5 +527,104 @@ class MikrotikService
                 $this->client()->query((new Query('/queue/simple/remove'))->equal('.id', $queue['.id']))->read();
             }
         }
+    }
+
+    /**
+     * Deteksi lokasi fisik router secara otomatis (Hardware GPS MikroTik atau IP Geolocation)
+     */
+    public function detectRouterLocation(?string $host = null): array
+    {
+        $targetHost = $host ?: env('MIKROTIK_HOST', '103.142.194.75');
+
+        // 1. Coba baca modul hardware GPS internal MikroTik (/system/gps/print)
+        try {
+            $gpsData = $this->client()->query('/system/gps/print')->read();
+            if (!empty($gpsData) && isset($gpsData[0]['latitude'], $gpsData[0]['longitude'])) {
+                $latRaw = $gpsData[0]['latitude'];
+                $lngRaw = $gpsData[0]['longitude'];
+                $valid  = ($gpsData[0]['valid'] ?? 'true') === 'true';
+
+                if ($valid && !empty($latRaw) && !empty($lngRaw)) {
+                    $lat = $this->parseGpsCoordinate((string) $latRaw);
+                    $lng = $this->parseGpsCoordinate((string) $lngRaw);
+
+                    if ($lat !== null && $lng !== null) {
+                        return [
+                            'status'    => 'success',
+                            'source'    => 'hardware_gps',
+                            'latitude'  => $lat,
+                            'longitude' => $lng,
+                            'location'  => 'GPS Internal MikroTik (' . ($gpsData[0]['satellites'] ?? 'N/A') . ' Satelit)',
+                        ];
+                    }
+                }
+            }
+        } catch (Throwable) {
+            // Hardware GPS tidak tersedia
+        }
+
+        // 2. Jika bukan IP privat / loopback, coba IP Geolocation API
+        if ($targetHost && !in_array($targetHost, ['127.0.0.1', 'localhost', '::1'])) {
+            $isPrivate = filter_var(
+                $targetHost,
+                FILTER_VALIDATE_IP,
+                FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+            ) === false;
+
+            if (!$isPrivate) {
+                try {
+                    $context = stream_context_create([
+                        'http' => [
+                            'timeout' => 4,
+                            'header'  => "User-Agent: MikroTik-GIS-Topology/1.0\r\n",
+                        ],
+                    ]);
+                    $json = @file_get_contents("http://ip-api.com/json/{$targetHost}", false, $context);
+                    if ($json) {
+                        $data = json_decode($json, true);
+                        if (($data['status'] ?? '') === 'success' && isset($data['lat'], $data['lon'])) {
+                            return [
+                                'status'    => 'success',
+                                'source'    => 'ip_geolocation',
+                                'latitude'  => (float) $data['lat'],
+                                'longitude' => (float) $data['lon'],
+                                'location'  => ($data['city'] ?? 'Kota') . ', ' . ($data['regionName'] ?? '') . ' (' . ($data['country'] ?? 'ID') . ')',
+                                'isp'       => $data['isp'] ?? ($data['org'] ?? 'ISP'),
+                            ];
+                        }
+                    }
+                } catch (Throwable) {
+                    // Fallback jika API gagal
+                }
+            }
+        }
+
+        return [
+            'status'  => 'error',
+            'message' => 'Tidak dapat mendeteksi koordinat otomatis (IP privat atau tidak ada GPS). Silakan gunakan GPS Browser.',
+        ];
+    }
+
+    private function parseGpsCoordinate(string $coord): ?float
+    {
+        $coord = trim($coord);
+        if (is_numeric($coord)) {
+            return (float) $coord;
+        }
+
+        // Format: "S 06 07.123" atau "E 106 09.456"
+        $parts = preg_split('/\s+/', $coord);
+        if (count($parts) >= 3) {
+            $hemisphere = strtoupper($parts[0]);
+            $deg = (float) $parts[1];
+            $min = (float) $parts[2];
+            $val = $deg + ($min / 60.0);
+            if ($hemisphere === 'S' || $hemisphere === 'W') {
+                $val = -$val;
+            }
+            return round($val, 6);
+        }
+
+        return null;
     }
 }
